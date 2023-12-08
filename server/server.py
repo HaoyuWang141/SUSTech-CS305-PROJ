@@ -112,8 +112,8 @@ class BaseHTTPRequestHandler:
 
         self.request_line = None
         self.request_method = None
-        self.request_path = None
         self.request_url = None
+        self.request_path = None
         self.request_params = {}
         self.request_httpVersion = None
         self.request_headers = {}
@@ -145,6 +145,10 @@ class BaseHTTPRequestHandler:
                     to_read if to_read < SIZE else SIZE
                 ).decode()
 
+        # TODO: 处理验证
+        # 接收完了请求，开始处理
+        # 权限认证
+
         method_name = "do_" + self.request_method
         if not hasattr(self, method_name):
             self.send_error(HTTPStatus.NOT_IMPLEMENTED)
@@ -153,14 +157,14 @@ class BaseHTTPRequestHandler:
         method()
 
     def parse_request_line(self, request_line):
-        method, path, version = request_line.split(" ")
-        self.request_path = path
+        method, url, version = request_line.split(" ")
+        self.request_url = url
         self.request_method = method
         self.request_httpVersion = version
-        url, query = path.split("?") if "?" in path else (path, None)
-        if not url.startswith("/"):
-            raise ValueError(f"Malformed url: {url}")
-        self.request_url = url
+        path, query = url.split("?") if "?" in url else (url, None)
+        if not path.startswith("/"):
+            raise ValueError(f"Malformed path: {path}")
+        self.request_path = path
         for param in query.split("&") if query else []:
             if "=" not in param:
                 raise ValueError(f"Malformed parameter: {param}")
@@ -598,6 +602,7 @@ def handle_client(connection, address):
             client_socket=connection,
             client_address=address,
         )
+        # TODO: 处理长连接 - 一个tcp连接可以处理多个http请求
         httpRequestHandler.handle_request()
     finally:
         connection.shutdown(socket.SHUT_WR)
