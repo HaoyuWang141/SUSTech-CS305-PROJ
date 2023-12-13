@@ -8,12 +8,18 @@ import sys
 from enum import IntEnum, Enum
 import time
 import mimetypes
-from typing import NamedTuple
+from dataclasses import dataclass
+import base64
+import secrets
 
+
+DEBUG = True  # 是否开启调试模式
 ROOT = "data/"  # 文件根目录
+TOCKEN_EXPIRE_TIME = 3600  # tocken过期时间, 单位秒
 
 
-class UserInfo(NamedTuple):
+@dataclass
+class UserInfo:
     username: str
     password: str
     tocken: str
@@ -21,9 +27,12 @@ class UserInfo(NamedTuple):
 
 
 class Users(Enum):
-    USER1 = UserInfo("user1", "password1", "tocken1", 100000000)
-    USER2 = UserInfo("user2", "password2", "tocken2", 100000000)
-    USER3 = UserInfo("user3", "password3", "tocken3", 100000000)
+    USER1 = UserInfo("user1", "1", "", 0)
+    USER2 = UserInfo("user2", "2", "", 0)
+    USER3 = UserInfo("user3", "3", "", 0)
+    USER4 = UserInfo("client1", "123", "", 0)
+    USER5 = UserInfo("client2", "123", "", 0)
+    USER6 = UserInfo("client3", "123", "", 0)
 
     @property
     def username(self):
@@ -40,6 +49,14 @@ class Users(Enum):
     @property
     def tocken_expire_time(self):
         return self.value.tocken_expire_time
+
+    @tocken.setter
+    def tocken(self, value):
+        self.value.tocken = value
+
+    @tocken_expire_time.setter
+    def tocken_expire_time(self, value):
+        self.value.tocken_expire_time = value
 
 
 class HTTPStatus(IntEnum):
@@ -108,7 +125,7 @@ class BaseHTTPRequestHandler:
         self.client_socket = client_socket
         self.client_address = client_address
 
-        self.user = Users.USER1
+        self.user: UserInfo = None
 
         self.request_line = None
         self.request_method = None
@@ -122,17 +139,34 @@ class BaseHTTPRequestHandler:
         self.response_headers = []
 
     def handle_request(self):
+        """
+        handle one request
+        Note:
+        1. decode all request data
+        2. recieive all entity body
+        3. parse request line, headers, body
+        4. check authorization
+        5. call do_{method} to handle request
+        6. persistent connection
+        """
         SIZE = 2048
-        raw_request = self.client_socket.recv(SIZE).decode()
-
-        request_line, rest = raw_request.split("\r\n", 1)
-        raw_headers, raw_body = rest.split("\r\n\r\n", 1)
+        try:
+            raw_request = self.client_socket.recv(SIZE).decode()
+            request_line, rest = raw_request.split("\r\n", 1)
+            raw_headers, raw_body = rest.split("\r\n\r\n", 1)
+        except ValueError as e:
+            # print(e)
+            # 有时会收到空请求, 这里直接忽略, 原因未知
+            return
+        except Exception as e:
+            print(e)
+            return
 
         self.request_line = request_line
         try:
             self.parse_request_line(request_line)
         except ValueError as e:
-            self.send_error(HTTPStatus.BAD_REQUEST, str(e))
+            self.send_error(HTTPStatus.BAD_REQUEST, message=str(e))
             return
         self.parse_headers(raw_headers)
         self.request_body = raw_body
@@ -145,16 +179,30 @@ class BaseHTTPRequestHandler:
                     to_read if to_read < SIZE else SIZE
                 ).decode()
 
-        # TODO: 处理验证
-        # 接收完了请求，开始处理
-        # 权限认证
+        authorized_pass = False
+        if self.verify_cookie():
+            self.log_debug(f"cookie verified: {self.user.username}")
+            authorized_pass = True
+        elif self.authorize():
+            self.log_debug(f"authorization verified: {self.user.username}")
+            authorized_pass = True
+            self.set_cookie()
 
-        method_name = "do_" + self.request_method
-        if not hasattr(self, method_name):
-            self.send_error(HTTPStatus.NOT_IMPLEMENTED)
-            return
-        method = getattr(self, method_name)
-        method()
+        if authorized_pass:
+            method_name = "do_" + self.request_method
+            if not hasattr(self, method_name):
+                self.send_error(HTTPStatus.NOT_IMPLEMENTED)
+                return
+            method = getattr(self, method_name)
+            method()
+
+        if self.request_headers.get("connection") == "keep-alive":
+            self.log_message("Connection: keep-alive")
+            self.handle_request()
+        elif self.request_headers.get("connection") == "close":
+            self.log_message("Connection: close")
+        else:
+            self.log_message("No 'Connection' header found, closing connection")
 
     def parse_request_line(self, request_line):
         method, url, version = request_line.split(" ")
@@ -179,25 +227,30 @@ class BaseHTTPRequestHandler:
     def send_response(self, code, message=None):
         self.log_request(code)
         response_line = f"HTTP/1.1 {code} {message}\r\n"
-        self.response_headers.append(response_line.encode("latin-1", "strict"))
+        self.response_headers = [response_line.encode("latin-1", "strict")] + self.response_headers
         self.send_header("Server", "CS305-2023Fall-PROJ-MiniHttpServer HTTP/1.1")
         self.send_header("Date", self.date_time_string())
 
-    def send_error(self, code, message=None):
-        self.log_error("code %d, message %s", code, message)
-        self.send_response(code, message)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.client_socket.sendall(
-            f"""<html>
-                    <head><title>Error {code}</title></head>
-                    <body>
-                        <h1>Error {code}</h1>
-                        <p>{message}</p> 
-                    </body>
-                </html>
-            """.encode()
+    def send_error(self, code: HTTPStatus, headers=None, message=None):
+        self.log_error(
+            "code %d, message %s", code, message if message else code.description
         )
+        self.send_response(code, code.phrase)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        for key, value in headers.items() if headers else []:
+            self.send_header(key, value)
+        response_body = f"""<html>
+                                <head><title>Error {code}</title></head>
+                                <body>
+                                    <h1>Error {code}</h1>
+                                    <p>{code.phrase} {code.description}</p>
+                                    <p>{message}</p> 
+                                </body>
+                            </html>
+                        """.encode()
+        self.send_header("Content-Length", str(len(response_body)))
+        self.end_headers()
+        self.client_socket.sendall(response_body)
 
     def send_header(self, key, value):
         header_line = f"{key}: {value}\r\n"
@@ -221,6 +274,17 @@ class BaseHTTPRequestHandler:
         print(
             f"\033[91mERR {self.client_address} [{self.log_date_time_string()}] {format % args}\033[0m"
         )
+
+    def log_message(self, format, *args):
+        print(
+            f"\033[92mMSG {self.client_address} [{self.log_date_time_string()}] {format % args}\033[0m"
+        )
+
+    def log_debug(self, format, *args):
+        if DEBUG:
+            print(
+                f"\033[93mDBG {self.client_address} [{self.log_date_time_string()}] {format % args}\033[0m"
+            )
 
     def date_time_string(self, timestamp=None):
         """Return the current date and time formatted for a message header."""
@@ -262,6 +326,75 @@ class BaseHTTPRequestHandler:
         "Dec",
     ]
 
+    def verify_cookie(self) -> bool:
+        if "cookie" not in self.request_headers:
+            return False
+        cookie = self.request_headers["cookie"]
+        if not cookie.startswith("session-id="):
+            return False
+        cookie = cookie[11:]
+        for user in Users:
+            if user.tocken != cookie:  # tocken不匹配
+                continue
+            if user.tocken_expire_time < int(time.time()):  # tocken过期
+                return False
+            self.user = user
+            return True
+        return False
+
+    def set_cookie(self):
+        if (
+            not self.user.tocken
+            or self.user.tocken == ""
+            or self.user.tocken_expire_time < int(time.time())
+        ):
+            session_id = secrets.token_hex(64)
+            self.log_debug(f"set cookie: {session_id} for user {self.user.username}")
+        else:
+            session_id = self.user.tocken
+        self.user.tocken = session_id
+        self.user.tocken_expire_time = int(time.time()) + TOCKEN_EXPIRE_TIME
+        self.send_header(
+            "Set-Cookie",
+            f"session-id={session_id}; Max-Age={TOCKEN_EXPIRE_TIME}; Path=/",
+        )
+
+    def authorize(self) -> bool:
+        if "authorization" not in self.request_headers:
+            self.send_error(
+                HTTPStatus.UNAUTHORIZED,
+                headers={"WWW-Authenticate": 'Basic realm="Authorization Required"'},
+            )
+            return False
+        authorization = self.request_headers["authorization"]
+        if not authorization.startswith("Basic "):
+            self.send_error(
+                HTTPStatus.UNAUTHORIZED,
+                headers={"WWW-Authenticate": 'Basic realm="Authorization Required"'},
+                message="Invalid authorization type",
+            )
+            return False
+        try:
+            authorization = base64.b64decode(authorization[6:]).decode()
+            username, password = authorization.split(":")
+        except Exception:
+            self.send_error(
+                HTTPStatus.UNAUTHORIZED,
+                headers={"WWW-Authenticate": 'Basic realm="Authorization Required"'},
+                message="Invalid authorization format",
+            )
+            return False
+        for user in Users:
+            if user.username == username and user.password == password:
+                self.user = user
+                return True
+        self.send_error(
+            HTTPStatus.UNAUTHORIZED,
+            headers={"WWW-Authenticate": 'Basic realm="Authorization Required"'},
+            message="Invalid username or password",
+        )
+        return False
+
 
 # 定义HTTP请求处理类
 class HttpRequestHandler(BaseHTTPRequestHandler):
@@ -269,7 +402,7 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
         super().__init__(client_socket, client_address)
         self.fileSystem = FileSystem(ROOT)
 
-    def do_GET(self):
+    def do_GET(self, NOT_SEND_BODY=False):
         """Serve a GET request."""
         if self.request_url.startswith("/favicon.ico"):
             size, mimetype, content = self.fileSystem.get_file("/asserts/favicon.ico")
@@ -279,158 +412,134 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.send_body(content)
             return
-        if not self.request_url.startswith(f"/{self.user.username}"):
-            self.send_error(HTTPStatus.BAD_REQUEST)
-            return
         if self.request_url.startswith("/upload") or self.request_url.startswith(
             "/delete"
         ):
             self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
             return
-        if self.request_params:
-            self.send_error(HTTPStatus.BAD_REQUEST)
-            return
 
-        filepath = self.request_url
+        request_path = self.request_path
 
         # 检查文件是否存在
-        if not self.fileSystem.exists(filepath):
-            self.send_error(HTTPStatus.NOT_FOUND, "File or directory not found")
+        if not self.fileSystem.exists(request_path):
+            self.send_error(HTTPStatus.NOT_FOUND, message="File or directory not found")
             return
 
         # 检查是否是目录
-        if self.fileSystem.is_dir(filepath):
-            # 如果是目录，则列出目录内容
-            try:
-                dir_list = self.fileSystem.list_directory(filepath)
-                if not self.fileSystem.is_same_path(filepath, f"/{self.user.username}"):
-                    dir_list = ["../"] + dir_list
-                dir_list = [
-                    f'<li><a href="{os.path.join(self.request_path, item)}">{item}</a></li>'
-                    for item in dir_list
-                ]
-                dir_list = [
-                    f'<li><a href="\{self.user.username}">/</a></li>'
-                ] + dir_list
-                dir_list = "\n".join(dir_list)
-                dir_list = f"""
-                    <html>
-                        <head><title>Index of {self.request_path}</title></head>
-                        <body>
-                            <h1>Index of {self.request_path}</h1>
-                            <ul>
-                                {dir_list}
-                            </ul>
-                        </body>
-                    </html>
-                """.encode(
-                    "utf-8"
+        if self.fileSystem.is_dir(request_path):
+            # 目录
+            # 目录存在，但是没有以/结尾，重定向到以/结尾的url
+            if not request_path.endswith("/"):
+                self.send_response(HTTPStatus.MOVED_PERMANENTLY)
+                location = self.request_path + "/"
+                if self.request_params:
+                    location += "?" + "&".join(
+                        [f"{key}={value}" for key, value in self.request_params.items()]
+                    )
+                self.send_header("Location", location)
+                self.end_headers()
+                return
+            # query params 中必须包含SUSTech-HTTP字段
+            if "SUSTech-HTTP" not in self.request_params:
+                self.send_error(
+                    HTTPStatus.BAD_REQUEST,
+                    message='Missing query param "SUSTech-HTTP"',
                 )
+                return
+            try:
+                if self.request_params["SUSTech-HTTP"] == "0":
+                    # SUSTech-HTTP字段为0, 返回 html
+                    dir_list = self.fileSystem.list_directory(request_path)
+                    if not self.fileSystem.is_same_path(request_path, f"/"):
+                        dir_list = ["../"] + dir_list
+                    dir_list = [
+                        f'<li><a href="{os.path.join(self.request_path, item)}?SUSTech-HTTP=0">{item}</a></li>'
+                        if item.endswith("/")
+                        else f'<li><a href="{os.path.join(self.request_path, item)}?SUSTech-HTTP=1">{item}</a></li>'
+                        for item in dir_list
+                    ]
+                    dir_list = [f'<li><a href="/?SUSTech-HTTP=0">/</a></li>'] + dir_list
+                    dir_list = "\n".join(dir_list)
+                    dir_list = f"""
+                        <html>
+                            <head><title>Index of {self.request_path}</title></head>
+                            <body>
+                                <h1>Index of {self.request_path}</h1>
+                                <ul>
+                                    {dir_list}
+                                </ul>
+                            </body>
+                        </html>
+                    """.encode()
+                elif self.request_params["SUSTech-HTTP"] == "1":
+                    # SUSTech-HTTP字段为1, 返回列表
+                    dir_list = str(
+                        self.fileSystem.list_directory(request_path)
+                    ).encode()
+                else:
+                    # SUSTech-HTTP字段不为0或1
+                    self.send_error(
+                        HTTPStatus.BAD_REQUEST,
+                        message='Invalid header "SUSTech-HTTP"',
+                    )
+                    return
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-type", "text/html")
                 self.send_header("Content-Length", str(len(dir_list)))
                 self.end_headers()
-                self.send_body(dir_list)
-            except Exception:
+                if NOT_SEND_BODY is False:
+                    self.send_body(dir_list)
+            except Exception as e:
+                print(e)
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
-        elif self.fileSystem.is_file(filepath):
+        elif self.fileSystem.is_file(request_path):
             # 如果是文件，则读取文件内容并发送
             try:
-                size, mimetype, content = self.fileSystem.get_file(filepath)
+                size, mimetype, content = self.fileSystem.get_file(request_path)
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-type", mimetype)
                 self.send_header("Content-Length", str(size))
                 self.end_headers()
-                self.send_body(content)
+                if NOT_SEND_BODY is False:
+                    self.send_body(content)
             except IOError:
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_HEAD(self):
-        """Serve a HEAD request"""
-        if not self.request_url.startswith(f"/{self.user.username}"):
-            self.send_error(HTTPStatus.BAD_REQUEST)
-            return
-        if self.request_url.startswith("/upload") or self.request_url.startswith(
-            "/delete"
-        ):
-            self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
-            return
-        if self.request_params:
-            self.send_error(HTTPStatus.BAD_REQUEST)
-            return
-
-        filepath = self.request_url
-
-        # 检查文件是否存在
-        if not self.fileSystem.exists(filepath):
-            self.send_error(HTTPStatus.NOT_FOUND, "File or directory not found")
-            return
-
-        # 检查是否是目录
-        if self.fileSystem.is_dir(filepath):
-            # 如果是目录，则列出目录内容
-            try:
-                dir_list = self.fileSystem.list_directory(filepath)
-                if not self.fileSystem.is_same_path(filepath, f"/{self.user.username}"):
-                    dir_list = ["../"] + dir_list
-                dir_list = [
-                    f'<li><a href="{os.path.join(self.request_path, item)}">{item}</a></li>'
-                    for item in dir_list
-                ]
-                dir_list = [
-                    f'<li><a href="\{self.user.username}">/</a></li>'
-                ] + dir_list
-                dir_list = "\n".join(dir_list)
-                dir_list = f"""
-                    <html>
-                        <head><title>Index of {self.request_path}</title></head>
-                        <body>
-                            <h1>Index of {self.request_path}</h1>
-                            <ul>
-                                {dir_list}
-                            </ul>
-                        </body>
-                    </html>
-                """.encode(
-                    "utf-8"
-                )
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-type", "text/html")
-                self.send_header("Content-Length", str(len(dir_list)))
-                self.end_headers()
-            except Exception:
-                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
-        elif self.fileSystem.is_file(filepath):
-            # 如果是文件，则读取文件内容并发送
-            try:
-                size, mimetype, content = self.fileSystem.get_file(filepath)
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-type", mimetype)
-                self.send_header("Content-Length", str(size))
-                self.end_headers()
-            except IOError:
-                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
+        """Serve a HEAD request."""
+        if self.request_path == "/":
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Length", str(0))
+            self.end_headers()
         else:
-            self.send_error(HTTPStatus.NOT_FOUND)
+            self.do_GET(NOT_SEND_BODY=True)
 
     def do_POST(self):
         """Serve a POST request"""
-        if self.request_url.startswith(f"/{self.user.username}"):
+        if self.request_path != "/upload" and self.request_path != "/delete":
             self.send_error(HTTPStatus.METHOD_NOT_ALLOWED)
             return
         if "path" not in self.request_params:
             self.send_error(HTTPStatus.BAD_REQUEST)
             return
+        if not self.request_params["path"].startswith(
+            f"/{self.user.username}"
+        ) and not self.request_params["path"].startswith(f"{self.user.username}"):
+            self.send_error(
+                HTTPStatus.UNAUTHORIZED,
+                message="You can only access your own files",
+            )
+            return
         if not self.fileSystem.is_dir(f"/{self.user.username}"):
             self.send_error(
                 HTTPStatus.SERVICE_INTERNAL_ERROR,
-                f"root directory for user {self.user.username} not found",
+                message=f"root directory for user {self.user.username} not found",
             )
             return
 
-        if self.request_url == "/upload":
+        if self.request_path == "/upload":
             try:
                 boundary = self.extract_boundary(self.request_headers["content-type"])
                 for filename, content in self.parse_multipart(
@@ -441,24 +550,22 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
                     )
                     self.fileSystem.save_file(filepath, content)
                 self.send_response(HTTPStatus.OK)
-                self.send_header("Content-type", "text/html")
                 self.send_header("Content-Length", str(0))
                 self.end_headers()
-            except ValueError as e:
-                self.send_error(HTTPStatus.BAD_REQUEST)
             except Exception:
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
 
-        elif self.request_url == "/delete":
+        elif self.request_path == "/delete":
             try:
                 self.fileSystem.delete_dir_or_file(self.request_params["path"])
-                os.makedirs(f"data/{self.user.username}", exist_ok=True)
+                os.makedirs(f"{ROOT}/{self.user.username}", exist_ok=True)
                 self.send_response(HTTPStatus.OK)
-                self.send_header("Content-type", "text/html")
                 self.send_header("Content-Length", str(0))
                 self.end_headers()
             except FileNotFoundError:
-                self.send_error(HTTPStatus.NOT_FOUND, "File or directory not exists")
+                self.send_error(
+                    HTTPStatus.NOT_FOUND, message="File or directory not exists"
+                )
             except Exception:
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
 
@@ -505,10 +612,6 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
                     filename = None
 
                 yield filename, content
-
-    def handle_authentication(self):
-        # 添加处理验证的逻辑
-        pass
 
 
 class FileSystem:
@@ -592,7 +695,11 @@ class FileSystem:
             raise FileNotFoundError
         if not os.path.isdir(dirpath):
             raise NotADirectoryError
-        return os.listdir(dirpath)
+        dir_list = os.listdir(dirpath)
+        for i in range(len(dir_list)):
+            if os.path.isdir(os.path.join(dirpath, dir_list[i])):
+                dir_list[i] += "/"
+        return dir_list
 
 
 # 处理每个客户端连接
@@ -602,18 +709,18 @@ def handle_client(connection, address):
             client_socket=connection,
             client_address=address,
         )
-        # TODO: 处理长连接 - 一个tcp连接可以处理多个http请求
         httpRequestHandler.handle_request()
     finally:
-        connection.shutdown(socket.SHUT_WR)
-        connection.close()
-        threads.remove(threading.current_thread())
+        with lock:
+            connection.close()
+            socket_list.remove(connection)
+
+
+socket_list = []
+lock = threading.Lock()
 
 
 # 运行服务器
-threads = []
-
-
 def run_server(host, port):
     server_address = (host, port)
 
@@ -630,8 +737,8 @@ def run_server(host, port):
                 thread = threading.Thread(
                     target=handle_client, args=(connection, address)
                 )
+                socket_list.append(connection)
                 thread.start()
-                threads.append(thread)
             except socket.timeout:
                 pass
 
@@ -640,8 +747,13 @@ def run_server(host, port):
 def signal_handler(signum, frame):
     print("Interrupt received, shutting down the server")
     # 这里可以添加任何清理代码
-    for thread in threads:
-        thread.join()
+    with lock:
+        for s in socket_list:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+                s.close()
+            except Exception:
+                ...
     sys.exit(0)
 
 
