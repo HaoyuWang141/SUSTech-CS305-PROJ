@@ -16,6 +16,7 @@ import secrets
 DEBUG = True  # 是否开启调试模式
 ROOT = "data/"  # 文件根目录
 TOCKEN_EXPIRE_TIME = 3600  # tocken过期时间, 单位秒
+CHUNK_SIZE = 2048  # 使用chunk传输文件时每次传输的大小, 单位字节
 
 
 @dataclass
@@ -157,17 +158,17 @@ class BaseHTTPRequestHandler:
         except ValueError as e:
             # print(e)
             # 有时会收到空请求, 这里直接忽略, 原因未知
-            return
+            return True
         except Exception as e:
             print(e)
-            return
+            return False
 
         self.request_line = request_line
         try:
             self.parse_request_line(request_line)
         except ValueError as e:
             self.send_error(HTTPStatus.BAD_REQUEST, message=str(e))
-            return
+            return False
         self.parse_headers(raw_headers)
         self.request_body = raw_body
 
@@ -190,19 +191,21 @@ class BaseHTTPRequestHandler:
 
         if authorized_pass:
             method_name = "do_" + self.request_method
-            if not hasattr(self, method_name):
+            if hasattr(self, method_name):
+                method = getattr(self, method_name)
+                method()
+            else:
                 self.send_error(HTTPStatus.NOT_IMPLEMENTED)
-                return
-            method = getattr(self, method_name)
-            method()
 
         if self.request_headers.get("connection") == "keep-alive":
             self.log_message("Connection: keep-alive")
-            self.handle_request()
+            return True
         elif self.request_headers.get("connection") == "close":
             self.log_message("Connection: close")
+            return False
         else:
             self.log_message("No 'Connection' header found, closing connection")
+            return False
 
     def parse_request_line(self, request_line):
         method, url, version = request_line.split(" ")
@@ -227,7 +230,9 @@ class BaseHTTPRequestHandler:
     def send_response(self, code, message=None):
         self.log_request(code)
         response_line = f"HTTP/1.1 {code} {message}\r\n"
-        self.response_headers = [response_line.encode("latin-1", "strict")] + self.response_headers
+        self.response_headers = [
+            response_line.encode("latin-1", "strict")
+        ] + self.response_headers
         self.send_header("Server", "CS305-2023Fall-PROJ-MiniHttpServer HTTP/1.1")
         self.send_header("Date", self.date_time_string())
 
@@ -407,7 +412,7 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
         if self.request_url.startswith("/favicon.ico"):
             size, mimetype, content = self.fileSystem.get_file("/asserts/favicon.ico")
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-type", mimetype)
+            self.send_header("Content-Type", mimetype)
             self.send_header("Content-Length", size)
             self.end_headers()
             self.send_body(content)
@@ -439,15 +444,11 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Location", location)
                 self.end_headers()
                 return
-            # query params 中必须包含SUSTech-HTTP字段
-            if "SUSTech-HTTP" not in self.request_params:
-                self.send_error(
-                    HTTPStatus.BAD_REQUEST,
-                    message='Missing query param "SUSTech-HTTP"',
-                )
-                return
             try:
-                if self.request_params["SUSTech-HTTP"] == "0":
+                if (
+                    "SUSTech-HTTP" not in self.request_params
+                    or self.request_params["SUSTech-HTTP"] == "0"
+                ):
                     # SUSTech-HTTP字段为0, 返回 html
                     dir_list = self.fileSystem.list_directory(request_path)
                     if not self.fileSystem.is_same_path(request_path, f"/"):
@@ -495,13 +496,15 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
         elif self.fileSystem.is_file(request_path):
             # 如果是文件，则读取文件内容并发送
             try:
-                size, mimetype, content = self.fileSystem.get_file(request_path)
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-type", mimetype)
-                self.send_header("Content-Length", str(size))
-                self.end_headers()
-                if NOT_SEND_BODY is False:
-                    self.send_body(content)
+                if "range" in self.request_headers:
+                    self.get_file_breakpoint_transmission(request_path, NOT_SEND_BODY)
+                elif (
+                    "chunked" in self.request_params
+                    and self.request_params["chunked"] == "1"
+                ):
+                    self.get_file_chunked(request_path, NOT_SEND_BODY)
+                else:
+                    self.get_file_raw(request_path, NOT_SEND_BODY)
             except IOError:
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR)
         else:
@@ -524,9 +527,11 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
         if "path" not in self.request_params:
             self.send_error(HTTPStatus.BAD_REQUEST)
             return
-        if not self.request_params["path"].startswith(
-            f"/{self.user.username}"
-        ) and not self.request_params["path"].startswith(f"{self.user.username}"):
+        if not self.request_params["path"].startswith("/"):
+            self.request_params["path"] = "/" + self.request_params["path"]
+        if not self.request_params["path"].endswith("/"):
+            self.request_params["path"] += "/"
+        if not self.request_params["path"].startswith(f"/{self.user.username}/"):
             self.send_error(
                 HTTPStatus.UNAUTHORIZED,
                 message="You can only access your own files",
@@ -613,6 +618,118 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
 
                 yield filename, content
 
+    def get_file_raw(self, request_path, NOT_SEND_BODY):
+        size, mimetype, content = self.fileSystem.get_file(request_path)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-type", mimetype)
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        if NOT_SEND_BODY is False:
+            self.send_body(content)
+
+    def get_file_chunked(self, request_path, NOT_SEND_BODY):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-type", self.fileSystem.get_file_type(request_path))
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        if NOT_SEND_BODY is False:
+            for content in self.fileSystem.get_file_chunks(
+                request_path, chunk_size=CHUNK_SIZE
+            ):
+                self.send_body(b"%X\r\n%s\r\n" % (len(content), content))
+            self.send_body(b"0\r\n\r\n")
+
+    def get_file_breakpoint_transmission(self, request_path, NOT_SEND_BODY):
+        try:
+            content_size = self.fileSystem.get_file_size(request_path)
+            ranges = self.parse_ranges(self.request_headers["range"], content_size)
+            self.log_debug(f"ranges: {ranges}")
+            if self.validate_ranges(ranges, content_size):
+                ranges = self.merge_ranges(ranges)
+            else:
+                raise ValueError("Invalid range for file size")
+            self.log_debug(f"merged ranges: {ranges}")
+            contents = []
+            for range_ in ranges:
+                contents.append(
+                    self.fileSystem.get_file_part(request_path, range_[0], range_[1])
+                )
+        except ValueError as e:
+            self.send_error(
+                HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
+                message=str(e),
+            )
+
+        self.send_response(HTTPStatus.PARTIAL_CONTENT)
+
+        if len(contents) == 1:
+            self.send_header(
+                "Content-Type", self.fileSystem.get_file_type(request_path)
+            )
+            self.send_header("Content-length", str(len(contents[0])))
+            self.send_header(
+                "Content-range",
+                f"bytes {ranges[0][0]}-{ranges[0][1]}/{content_size}",
+            )
+            self.end_headers()
+            if NOT_SEND_BODY is False:
+                self.send_body(contents[0])
+        else:
+            boundary = secrets.token_hex(16)
+            self.send_header(
+                "Content-Type", f"multipart/byteranges; boundary={boundary}"
+            )
+            entity_body = b""
+            for range_, content in zip(ranges, contents):
+                entity_body += (
+                    f"--{boundary}\r\n"
+                    f"Content-type: {self.fileSystem.get_file_type(request_path)}\r\n"
+                    f"Content-range: bytes {range_[0]}-{range_[1]}/{content_size}\r\n"
+                    f"\r\n"
+                    f"{content}\r\n"
+                ).encode()
+
+            self.send_header("Content-length", str(len(entity_body)))
+            self.end_headers()
+            if NOT_SEND_BODY is False:
+                self.send_body(entity_body)
+
+    def parse_ranges(self, range_header, content_size):
+        # 移除 "bytes=" 前缀并按逗号分割
+        ranges = range_header.replace("bytes=", "").split(",")
+        result = []
+
+        for r in ranges:
+            start, end = r.split("-")
+            end = int(end) if end else None
+            if start == "":
+                start = content_size - end
+                end = content_size - 1
+            else:
+                start = int(start) if start else None
+            result.append((start, end))
+
+        return result
+
+    def validate_ranges(self, ranges, content_size):
+        return all(
+            start <= end and end <= content_size
+            for start, end in ranges
+            if start is not None and end is not None
+        )
+
+    def merge_ranges(self, ranges):
+        ranges.sort()
+        merged = []
+
+        for current in ranges:
+            if not merged or current[0] > merged[-1][1] + 1:
+                merged.append(current)
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], current[1]))
+
+        return merged
+
 
 class FileSystem:
     def __init__(self, root):
@@ -644,6 +761,41 @@ class FileSystem:
         with open(filepath, "rb") as file:
             content = file.read()
         return size, mimetype, content
+
+    def get_file_type(self, path):
+        filepath = os.path.join(self.root, path.lstrip("/"))
+        if not os.path.exists(filepath):
+            raise FileNotFoundError
+        return mimetypes.guess_type(filepath)[0]
+
+    def get_file_size(self, path):
+        filepath = os.path.join(self.root, path.lstrip("/"))
+        if not os.path.exists(filepath):
+            raise FileNotFoundError
+        return os.path.getsize(filepath)
+
+    def get_file_chunks(self, path, chunk_size=1024):
+        filepath = os.path.join(self.root, path.lstrip("/"))
+        if not os.path.exists(filepath):
+            raise FileNotFoundError
+        with open(filepath, "rb") as file:
+            while True:
+                content = file.read(chunk_size)
+                if not content:
+                    break
+                yield content
+
+    def get_file_part(self, path, start, end):
+        filepath = os.path.join(self.root, path.lstrip("/"))
+        if not os.path.exists(filepath):
+            raise FileNotFoundError("File does not exist")
+
+        if start < 0 or end > os.path.getsize(filepath):
+            raise ValueError("Invalid range for file size")
+
+        with open(filepath, "rb") as file:
+            file.seek(start)  # 移动到开始位置
+            return file.read(end - start + 1)  # 读取指定范围的数据
 
     def save_file(self, path, content):
         filepath = os.path.join(self.root, path.lstrip("/"))
