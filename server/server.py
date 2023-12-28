@@ -1,22 +1,41 @@
+# 文档提供的库
 import socket
 import threading
 import os
 import argparse
-from urllib.parse import unquote
 import signal
 import sys
-from enum import IntEnum, Enum
 import time
 import mimetypes
+
+# 其他
+from enum import IntEnum, Enum
 from dataclasses import dataclass
 import base64
 import secrets
 
+# RSA
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding as pd_rsa
+
+# AES
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import padding as pd_aes
 
 DEBUG = True  # 是否开启调试模式
 ROOT = "data/"  # 文件根目录
-TOCKEN_EXPIRE_TIME = 3600  # tocken过期时间, 单位秒
-CHUNK_SIZE = 2048  # 使用chunk传输文件时每次传输的大小, 单位字节
+TOCKEN_EXPIRE_TIME = 5  # tocken过期时间, 单位秒
+CHUNK_SIZE = 8  # 使用chunk传输文件时每次传输的大小, 单位字节
+
+# 生成密钥对
+PRIVATE_KEY = rsa.generate_private_key(
+    public_exponent=65537, key_size=2048, backend=default_backend()
+)
+PUBLIC_KEY = PRIVATE_KEY.public_key()
 
 
 @dataclass
@@ -139,6 +158,8 @@ class BaseHTTPRequestHandler:
 
         self.response_headers = []
 
+        self.aes = None
+
     def handle_request(self):
         """
         handle one request
@@ -152,33 +173,45 @@ class BaseHTTPRequestHandler:
         """
         SIZE = 2048
         try:
-            raw_request = self.client_socket.recv(SIZE).decode()
-            request_line, rest = raw_request.split("\r\n", 1)
-            raw_headers, raw_body = rest.split("\r\n\r\n", 1)
+            raw_request = self.client_socket.recv(SIZE)
+            print(raw_request)
+            if raw_request == b"":  # socket is closed
+                return False
+            if raw_request.startswith(b"ENCRYPTED"):
+                self.aes = EncryptorServer(self.client_socket).handle_request()
+                return True
+            request_line, rest = raw_request.split(b"\r\n", 1)
+            raw_headers, raw_body = rest.split(b"\r\n\r\n", 1)
         except ValueError as e:
-            # print(e)
+            print(e)
             # 有时会收到空请求, 这里直接忽略, 原因未知
-            return True
+            return False
         except Exception as e:
             print(e)
             return False
 
-        self.request_line = request_line
+        self.request_line = request_line.decode()
         try:
-            self.parse_request_line(request_line)
+            self.parse_request_line(self.request_line)
         except ValueError as e:
             self.send_error(HTTPStatus.BAD_REQUEST, message=str(e))
             return False
-        self.parse_headers(raw_headers)
-        self.request_body = raw_body
+        self.parse_headers(raw_headers.decode())
 
         if "content-length" in self.request_headers:
             content_length = int(self.request_headers["content-length"])
             if len(raw_body) < content_length:
                 to_read = content_length - len(raw_body)
-                self.request_body += self.client_socket.recv(
-                    to_read if to_read < SIZE else SIZE
-                ).decode()
+                raw_body += self.client_socket.recv(to_read if to_read < SIZE else SIZE)
+
+        if self.aes:
+            raw_body = self.aes.decrypt(raw_body)
+        raw_body = raw_body.decode()
+        self.request_body = raw_body
+
+        self.log_debug(f"request line:\n{self.request_line}")
+        self.log_debug(f"request headers:\n{self.request_headers}")
+        self.log_debug(f"request body:\n{self.request_body}")
 
         authorized_pass = False
         if self.verify_cookie():
@@ -196,11 +229,10 @@ class BaseHTTPRequestHandler:
                 method()
             else:
                 self.send_error(HTTPStatus.NOT_IMPLEMENTED)
-
-        if self.request_headers.get("connection") == "keep-alive":
+        if self.request_headers.get("connection").lower() == "keep-alive":
             self.log_message("Connection: keep-alive")
             return True
-        elif self.request_headers.get("connection") == "close":
+        elif self.request_headers.get("connection").lower() == "close":
             self.log_message("Connection: close")
             return False
         else:
@@ -238,20 +270,21 @@ class BaseHTTPRequestHandler:
 
     def send_error(self, code: HTTPStatus, headers=None, message=None):
         self.log_error(
-            "code %d, message %s", code, message if message else code.description
+            "code %d, message: %s", code, message if message else code.description
         )
         self.send_response(code, code.phrase)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         for key, value in headers.items() if headers else []:
             self.send_header(key, value)
-        response_body = f"""<html>
-                                <head><title>Error {code}</title></head>
-                                <body>
-                                    <h1>Error {code}</h1>
-                                    <p>{code.phrase} {code.description}</p>
-                                    <p>{message}</p> 
-                                </body>
-                            </html>
+        response_body = f"""
+<html>
+    <head><title>Error {code}</title></head>
+    <body>
+        <h1>Error {code}</h1>
+        <p>{code.phrase} {code.description}</p>
+        <p>{message}</p> 
+    </body>
+</html>
                         """.encode()
         self.send_header("Content-Length", str(len(response_body)))
         self.end_headers()
@@ -264,6 +297,7 @@ class BaseHTTPRequestHandler:
     def end_headers(self):
         self.response_headers.append(b"\r\n")
         self.client_socket.sendall(b"".join(self.response_headers))
+        self.response_headers = []
 
     def send_body(self, body):
         self.client_socket.sendall(body)
@@ -334,16 +368,19 @@ class BaseHTTPRequestHandler:
     def verify_cookie(self) -> bool:
         if "cookie" not in self.request_headers:
             return False
-        cookie = self.request_headers["cookie"]
-        if not cookie.startswith("session-id="):
+        cookie = self.request_headers["cookie"].lower()
+        if not (cookie.startswith("session-id=") or cookie.startswith("session_id=")):
             return False
         cookie = cookie[11:]
         for user in Users:
             if user.tocken != cookie:  # tocken不匹配
                 continue
             if user.tocken_expire_time < int(time.time()):  # tocken过期
+                user.tocken = ""
+                user.tocken_expire_time = 0
                 return False
             self.user = user
+            self.user.tocken_expire_time = int(time.time()) + TOCKEN_EXPIRE_TIME
             return True
         return False
 
@@ -353,7 +390,7 @@ class BaseHTTPRequestHandler:
             or self.user.tocken == ""
             or self.user.tocken_expire_time < int(time.time())
         ):
-            session_id = secrets.token_hex(64)
+            session_id = secrets.token_hex(16)
             self.log_debug(f"set cookie: {session_id} for user {self.user.username}")
         else:
             session_id = self.user.tocken
@@ -434,16 +471,16 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
         if self.fileSystem.is_dir(request_path):
             # 目录
             # 目录存在，但是没有以/结尾，重定向到以/结尾的url
-            if not request_path.endswith("/"):
-                self.send_response(HTTPStatus.MOVED_PERMANENTLY)
-                location = self.request_path + "/"
-                if self.request_params:
-                    location += "?" + "&".join(
-                        [f"{key}={value}" for key, value in self.request_params.items()]
-                    )
-                self.send_header("Location", location)
-                self.end_headers()
-                return
+            # if not request_path.endswith("/"):
+            # self.send_response(HTTPStatus.MOVED_PERMANENTLY)
+            # location = self.request_path + "/"
+            # if self.request_params:
+            #     location += "?" + "&".join(
+            #         [f"{key}={value}" for key, value in self.request_params.items()]
+            #     )
+            # self.send_header("Location", location)
+            # self.end_headers()
+            # return
             try:
                 if (
                     "SUSTech-HTTP" not in self.request_params
@@ -460,18 +497,17 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
                         for item in dir_list
                     ]
                     dir_list = [f'<li><a href="/?SUSTech-HTTP=0">/</a></li>'] + dir_list
-                    dir_list = "\n".join(dir_list)
-                    dir_list = f"""
-                        <html>
-                            <head><title>Index of {self.request_path}</title></head>
-                            <body>
-                                <h1>Index of {self.request_path}</h1>
-                                <ul>
-                                    {dir_list}
-                                </ul>
-                            </body>
-                        </html>
-                    """.encode()
+                    dir_list = "\n            ".join(dir_list)
+                    dir_list = f"""<html>
+    <head><title>Index of {self.request_path}</title></head>
+    <body>
+        <h1>Index of {self.request_path}</h1>
+        <ul>
+            {dir_list}
+        </ul>
+    </body>
+</html>
+""".encode()
                 elif self.request_params["SUSTech-HTTP"] == "1":
                     # SUSTech-HTTP字段为1, 返回列表
                     dir_list = str(
@@ -484,6 +520,7 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
                         message='Invalid header "SUSTech-HTTP"',
                     )
                     return
+                dir_list = self.aes.encrypt(dir_list) if self.aes else dir_list
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-type", "text/html")
                 self.send_header("Content-Length", str(len(dir_list)))
@@ -512,7 +549,7 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         """Serve a HEAD request."""
-        if self.request_path == "/":
+        if self.request_path == "/" or self.request_path == "":
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Length", str(0))
             self.end_headers()
@@ -529,20 +566,14 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
             return
         if not self.request_params["path"].startswith("/"):
             self.request_params["path"] = "/" + self.request_params["path"]
-        if not self.request_params["path"].endswith("/"):
-            self.request_params["path"] += "/"
-        if not self.request_params["path"].startswith(f"/{self.user.username}/"):
+        if not self.request_params["path"].startswith(f"/{self.user.username}"):
             self.send_error(
-                HTTPStatus.UNAUTHORIZED,
+                HTTPStatus.FORBIDDEN,
                 message="You can only access your own files",
             )
             return
         if not self.fileSystem.is_dir(f"/{self.user.username}"):
-            self.send_error(
-                HTTPStatus.SERVICE_INTERNAL_ERROR,
-                message=f"root directory for user {self.user.username} not found",
-            )
-            return
+            os.makedirs(f"{ROOT}/{self.user.username}", exist_ok=True)
 
         if self.request_path == "/upload":
             try:
@@ -620,6 +651,7 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
 
     def get_file_raw(self, request_path, NOT_SEND_BODY):
         size, mimetype, content = self.fileSystem.get_file(request_path)
+        content = self.aes.encrypt(content) if self.aes else content
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-type", mimetype)
         self.send_header("Content-Length", str(size))
@@ -636,6 +668,7 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
             for content in self.fileSystem.get_file_chunks(
                 request_path, chunk_size=CHUNK_SIZE
             ):
+                content = self.aes.encrypt(content) if self.aes else content
                 self.send_body(b"%X\r\n%s\r\n" % (len(content), content))
             self.send_body(b"0\r\n\r\n")
 
@@ -644,11 +677,14 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
             content_size = self.fileSystem.get_file_size(request_path)
             ranges = self.parse_ranges(self.request_headers["range"], content_size)
             self.log_debug(f"ranges: {ranges}")
-            if self.validate_ranges(ranges, content_size):
-                ranges = self.merge_ranges(ranges)
-            else:
+            # 不进行merge, 直接返回多个部分
+            # if self.validate_ranges(ranges, content_size):
+            #     ranges = self.merge_ranges(ranges)
+            # else:
+            #     raise ValueError("Invalid range for file size")
+            # self.log_debug(f"merged ranges: {ranges}")
+            if not self.validate_ranges(ranges, content_size):
                 raise ValueError("Invalid range for file size")
-            self.log_debug(f"merged ranges: {ranges}")
             contents = []
             for range_ in ranges:
                 contents.append(
@@ -663,17 +699,19 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.PARTIAL_CONTENT)
 
         if len(contents) == 1:
+            content = contents[0]
+            content = self.aes.encrypt(content) if self.aes else content
             self.send_header(
                 "Content-Type", self.fileSystem.get_file_type(request_path)
             )
-            self.send_header("Content-length", str(len(contents[0])))
+            self.send_header("Content-length", str(len(content)))
             self.send_header(
                 "Content-range",
                 f"bytes {ranges[0][0]}-{ranges[0][1]}/{content_size}",
             )
             self.end_headers()
             if NOT_SEND_BODY is False:
-                self.send_body(contents[0])
+                self.send_body(content)
         else:
             boundary = secrets.token_hex(16)
             self.send_header(
@@ -686,8 +724,10 @@ class HttpRequestHandler(BaseHTTPRequestHandler):
                     f"Content-type: {self.fileSystem.get_file_type(request_path)}\r\n"
                     f"Content-range: bytes {range_[0]}-{range_[1]}/{content_size}\r\n"
                     f"\r\n"
-                    f"{content}\r\n"
                 ).encode()
+                entity_body += self.aes.encrypt(content) if self.aes else content
+                entity_body += b"\r\n"
+            entity_body += f"--{boundary}--\r\n".encode()
 
             self.send_header("Content-length", str(len(entity_body)))
             self.end_headers()
@@ -854,6 +894,88 @@ class FileSystem:
         return dir_list
 
 
+class RSA:
+    def __init__(self, public_key, private_key):
+        self.public_key = public_key
+        self.private_key = private_key
+
+    def encrypt(self, message):
+        encrypted_message = self.public_key.encrypt(
+            message,
+            pd_rsa.OAEP(
+                mgf=pd_rsa.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        return encrypted_message
+
+    def decrypt(self, message):
+        decrypted_message = self.private_key.decrypt(
+            message,
+            pd_rsa.OAEP(
+                mgf=pd_rsa.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+        return decrypted_message
+
+
+class AES:
+    def __init__(self, key, iv):
+        self.key = key
+        self.iv = iv
+        self.cipher = Cipher(
+            algorithms.AES(key), modes.CBC(iv), backend=default_backend()
+        )
+
+    def encrypt(self, message):
+        padder = pd_aes.PKCS7(128).padder()
+        padded_data = padder.update(message) + padder.finalize()
+        encryptor = self.cipher.encryptor()
+        encrypted_message = encryptor.update(padded_data) + encryptor.finalize()
+        return encrypted_message
+
+    def decrypt(self, message):
+        if message is None or message == b"":
+            return message
+        decryptor = self.cipher.decryptor()
+        decrypted_data = decryptor.update(message) + decryptor.finalize()
+        unpadder = pd_aes.PKCS7(128).unpadder()
+        unpadded_data = unpadder.update(decrypted_data) + unpadder.finalize()
+        return unpadded_data
+
+
+class EncryptorServer:
+    def __init__(self, connection):
+        self.connection = connection
+        self.rsa = RSA(PUBLIC_KEY, PRIVATE_KEY)
+        self.aes = None
+        self.hello()
+
+    def hello(self):
+        self.connection.sendall(
+            PUBLIC_KEY.public_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+
+    def handle_request(self):
+        request = self.connection.recv(2048)
+        request = self.rsa.decrypt(request)
+        print(request)
+        key, iv = request.split(b"\r\n")
+        self.aes = AES(key, iv)
+        self.connection.sendall(b"OK")
+        return self.aes
+
+
+socket_list = []
+lock = threading.Lock()
+
+
 # 处理每个客户端连接
 def handle_client(connection, address):
     try:
@@ -861,15 +983,24 @@ def handle_client(connection, address):
             client_socket=connection,
             client_address=address,
         )
-        httpRequestHandler.handle_request()
+        while httpRequestHandler.handle_request():
+            httpRequestHandler.user = None
+
+            httpRequestHandler.request_line = None
+            httpRequestHandler.request_method = None
+            httpRequestHandler.request_url = None
+            httpRequestHandler.request_path = None
+            httpRequestHandler.request_params = {}
+            httpRequestHandler.request_httpVersion = None
+            httpRequestHandler.request_headers = {}
+            httpRequestHandler.request_body = None
+
+            httpRequestHandler.response_headers = []
     finally:
         with lock:
             connection.close()
             socket_list.remove(connection)
-
-
-socket_list = []
-lock = threading.Lock()
+            print(f"socket {address} is closed")
 
 
 # 运行服务器
